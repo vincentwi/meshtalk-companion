@@ -208,6 +208,27 @@ class GlassesGattServer(
         return sentCount
     }
 
+    /**
+     * Send an Opus audio frame to a SINGLE glass identified by [mac].
+     * Used by per-glass mesh routing: audio arriving on WS-B is destined
+     * only for the glass whose MAC corresponds to WS-B.
+     *
+     * @param mac  BLE MAC address of the target glass
+     * @param opusFrame  The Opus-encoded audio frame to send
+     * @return 1 if sent successfully, 0 if device not found or notifications not enabled
+     */
+    fun sendAudioToSingleGlass(mac: String, opusFrame: ByteArray): Int {
+        val char = audioRxChar ?: return 0
+        val server = gattServer ?: return 0
+        val device = connectedDevices[mac] ?: return 0
+
+        val notifications = deviceNotifications[mac] ?: return 0
+        if (CHAR_AUDIO_RX !in notifications) return 0
+
+        char.value = opusFrame
+        return if (server.notifyCharacteristicChanged(device, char, false)) 1 else 0
+    }
+
     /** True if at least one pair of glasses is connected */
     val isGlassesConnected: Boolean get() = connectedDevices.isNotEmpty()
 

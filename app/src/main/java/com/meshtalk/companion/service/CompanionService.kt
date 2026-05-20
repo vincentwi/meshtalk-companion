@@ -16,14 +16,23 @@ import com.meshtalk.companion.MainActivity
 import com.meshtalk.companion.R
 import com.meshtalk.companion.ble.GlassesGattServer
 import com.meshtalk.companion.mesh.AudioRelay
-import com.meshtalk.companion.mesh.WebSocketMeshClient
+import com.meshtalk.companion.mesh.MeshClientManager
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
 /**
- * Foreground service that runs the BLE GATT server and WebSocket mesh client.
+ * Foreground service that runs the BLE GATT server and per-glass WebSocket
+ * mesh connections via [MeshClientManager].
+ *
+ * Per-glass mesh routing:
+ *   Each connected glass gets its own WebSocket to the bridge, identified by
+ *   "glass_{last4mac}". Audio from Glass A flows through WS-A to the bridge,
+ *   which relays it to WS-B (a different connection), and the phone delivers
+ *   it to Glass B. This eliminates the single-connection problem where the
+ *   bridge would exclude the phone (the only sender) and Glass B would never
+ *   receive audio.
  *
  * Lifecycle:
  *   startService → onCreate → onStartCommand → startForeground → start BLE + mesh
@@ -50,7 +59,7 @@ class CompanionService : Service() {
     }
 
     private var gattServer: GlassesGattServer? = null
-    private var meshClient: WebSocketMeshClient? = null
+    private var meshManager: MeshClientManager? = null
     private var audioRelay: AudioRelay? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var statusTask: ScheduledFuture<*>? = null
@@ -107,25 +116,22 @@ class CompanionService : Service() {
         val gatt = GlassesGattServer(this, gattListener)
         gattServer = gatt
 
-        // Create WebSocket mesh client
-        val userId = "phone_${Build.MODEL.replace(" ", "_")}_${System.currentTimeMillis() % 10000}"
-        val mesh = WebSocketMeshClient(
+        // Create per-glass mesh client manager
+        val manager = MeshClientManager(
             host = MESH_BRIDGE_HOST,
             port = MESH_BRIDGE_PORT,
-            userId = userId,
             initialChannel = currentChannel,
-            listener = meshListener
+            listener = meshManagerListener
         )
-        meshClient = mesh
+        meshManager = manager
 
-        // Create audio relay (WebSocket-backed)
-        audioRelay = AudioRelay(gatt, mesh)
+        // Create audio relay (per-glass WS routing)
+        audioRelay = AudioRelay(gatt, manager)
 
-        // Start components
+        // Start BLE GATT server (mesh WS connections are started per-glass on BLE connect)
         val bleOk = gatt.start()
-        mesh.start()
 
-        sendLog("BLE: ${if (bleOk) "OK" else "FAILED"} | Mesh: connecting to $MESH_BRIDGE_HOST:$MESH_BRIDGE_PORT")
+        sendLog("BLE: ${if (bleOk) "OK" else "FAILED"} | Mesh: per-glass routing via $MESH_BRIDGE_HOST:$MESH_BRIDGE_PORT")
 
         // Periodic status broadcast
         statusTask = scheduler.scheduleAtFixedRate({
@@ -142,9 +148,9 @@ class CompanionService : Service() {
         statusTask?.cancel(false)
         notificationUpdateTask?.cancel(false)
         gattServer?.stop()
-        meshClient?.stop()
+        meshManager?.stopAll()
         gattServer = null
-        meshClient = null
+        meshManager = null
         audioRelay = null
     }
 
@@ -154,11 +160,18 @@ class CompanionService : Service() {
         override fun onGlassesConnected(device: BluetoothDevice) {
             glassesConnected = true
             bleConnectionCount++
+
+            // Open a dedicated WebSocket for this glass
+            meshManager?.addGlass(device.address)
+
             updateNotificationWithStats()
             broadcastStatus()
         }
 
         override fun onGlassesDisconnected(device: BluetoothDevice) {
+            // Close the dedicated WebSocket for this glass
+            meshManager?.removeGlass(device.address)
+
             // Only set glassesConnected=false if no other glasses remain connected
             val stillConnected = gattServer?.isGlassesConnected == true
             glassesConnected = stillConnected
@@ -167,8 +180,8 @@ class CompanionService : Service() {
         }
 
         override fun onAudioFromGlasses(device: BluetoothDevice, data: ByteArray) {
-            // Pass sender device MAC for echo prevention
-            audioRelay?.onAudioFromGlasses(data, senderDeviceMac = device.address)
+            // Route through the sender glass's own WS connection
+            audioRelay?.onAudioFromGlasses(data, senderMac = device.address)
         }
 
         override fun onControlMessage(device: BluetoothDevice, json: String) {
@@ -180,31 +193,27 @@ class CompanionService : Service() {
         }
     }
 
-    // ── Mesh Listener ────────────────────────────────────────────
+    // ── Mesh Manager Listener ────────────────────────────────────
 
-    private val meshListener = object : WebSocketMeshClient.Listener {
-        override fun onConnected() {
-            meshBridgeConnected = true
-            updateNotificationWithStats()
-            broadcastStatus()
+    private val meshManagerListener = object : MeshClientManager.Listener {
+        override fun onAudioForGlass(glassMac: String, data: ByteArray) {
+            // Audio arrived on WS-B → deliver to Glass B only
+            audioRelay?.onAudioFromMesh(data, forGlassMac = glassMac)
         }
 
-        override fun onDisconnected() {
-            meshBridgeConnected = false
-            updateNotificationWithStats()
+        override fun onPeersChanged() {
             broadcastStatus()
-        }
-
-        override fun onPeersChanged(peers: List<WebSocketMeshClient.PeerInfo>) {
-            broadcastStatus()
-        }
-
-        override fun onAudioFromMesh(data: ByteArray, fromPeer: WebSocketMeshClient.PeerInfo) {
-            audioRelay?.onAudioFromMesh(data, fromPeer)
         }
 
         override fun onLog(msg: String) {
             sendLog(msg)
+        }
+
+        override fun onMeshConnectionChanged(glassMac: String, connected: Boolean) {
+            // Update aggregate connection state
+            meshBridgeConnected = meshManager?.isAnyConnected() == true
+            updateNotificationWithStats()
+            broadcastStatus()
         }
     }
 
@@ -226,7 +235,7 @@ class CompanionService : Service() {
     // ── Status Broadcasting ──────────────────────────────────────
 
     private fun broadcastStatus() {
-        val peerCount = meshClient?.getPeersOnChannel()?.size ?: 0
+        val peerCount = meshManager?.getPeerCount() ?: 0
         val intent = Intent(MainActivity.ACTION_STATUS_UPDATE).apply {
             setPackage(packageName)
             putExtra(MainActivity.EXTRA_BLE_CONNECTED, glassesConnected)
@@ -242,7 +251,7 @@ class CompanionService : Service() {
             put("peers", peerCount)
             put("channel", currentChannel)
             put("mesh_connected", meshBridgeConnected)
-            put("mesh_active", meshClient != null)
+            put("mesh_active", meshManager != null)
         }
         gattServer?.sendStatus(statusJson.toString())
     }
@@ -253,7 +262,7 @@ class CompanionService : Service() {
             setPackage(packageName)
             putExtra(MainActivity.EXTRA_BLE_CONNECTED, glassesConnected)
             putExtra(MainActivity.EXTRA_CHANNEL, currentChannel)
-            putExtra(MainActivity.EXTRA_PEER_COUNT, meshClient?.getPeersOnChannel()?.size ?: 0)
+            putExtra(MainActivity.EXTRA_PEER_COUNT, meshManager?.getPeerCount() ?: 0)
             putExtra(MainActivity.EXTRA_PACKET_COUNT, audioRelay?.totalPacketsRelayed ?: 0L)
             putExtra(EXTRA_MESH_CONNECTED, meshBridgeConnected)
             putExtra(MainActivity.EXTRA_LOG_LINE, msg)
@@ -264,7 +273,7 @@ class CompanionService : Service() {
     // ── Notification ─────────────────────────────────────────────
 
     private fun buildNotification(): Notification {
-        val peerCount = meshClient?.getPeersOnChannel()?.size ?: 0
+        val peerCount = meshManager?.getPeerCount() ?: 0
         val packetsRelayed = audioRelay?.totalPacketsRelayed ?: 0L
         val bleStatus = if (glassesConnected) "BLE: ✓ Connected" else "BLE: ✗ Waiting"
         val meshStatus = if (meshBridgeConnected) "Mesh: ✓ Online" else "Mesh: ✗ Offline"

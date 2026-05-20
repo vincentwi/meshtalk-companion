@@ -5,27 +5,24 @@ import com.meshtalk.companion.ble.GlassesGattServer
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * AudioRelay routes audio between the local BLE glasses and the mesh network.
+ * AudioRelay routes audio between local BLE glasses and the mesh network,
+ * using per-glass WebSocket connections managed by [MeshClientManager].
  *
- * Supports both the legacy UDP [MeshDiscovery] backend and the new
- * [WebSocketMeshClient] backend. Use the appropriate constructor.
+ * Per-glass routing flow:
+ *   Glass A → BLE write (ea01) → onAudioFromGlasses(frame, macA)
+ *           → MeshClientManager.getClientForGlass(macA).sendAudioToMesh()
+ *           → Bridge relays to all OTHER WS connections (not macA's)
+ *           → WS-B receives audio → onAudioFromMesh(frame, macB)
+ *           → gattServer.sendAudioToSingleGlass(macB, frame)
+ *           → BLE notify (ea02) → Glass B
  *
- * WebSocket flow:
- *   glasses -> BLE write (ea01) -> onAudioFromGlasses() -> ws.sendAudioToMesh() -> bridge -> peers
- *   bridge -> ws binary message -> onAudioFromMesh() -> sendAudioToGlasses() -> BLE notify (ea02)
- *
- * Legacy UDP flow:
- *   glasses -> BLE write (ea01) -> onAudioFromGlasses() -> sendAudioToMesh() -> UDP to peers
- *   UDP from peers -> onAudioFromMesh() -> sendAudioToGlasses() -> BLE notify (ea02)
- *
- * Echo prevention: when glasses send audio, the sender device MAC is tracked so
- * the GATT server can exclude it from the broadcast back (prevents hearing your
- * own voice echoed through the mesh).
+ * Echo prevention is structural: the bridge never sends audio back to the
+ * sender's WebSocket connection. Because each glass has its own connection,
+ * Glass A's audio is never echoed back to Glass A.
  */
-class AudioRelay private constructor(
+class AudioRelay(
     private val gattServer: GlassesGattServer,
-    private val meshDiscovery: MeshDiscovery?,
-    private val wsMeshClient: WebSocketMeshClient?
+    private val meshManager: MeshClientManager
 ) {
     companion object {
         private const val TAG = "AudioRelay"
@@ -35,110 +32,44 @@ class AudioRelay private constructor(
 
     val totalPacketsRelayed: Long get() = packetsRelayed.get()
 
-    // -- Constructors ----------------------------------------------
-
-    /**
-     * WebSocket-backed relay (preferred).
-     * Audio flows through the MeshTalk bridge server.
-     */
-    constructor(
-        gattServer: GlassesGattServer,
-        wsMeshClient: WebSocketMeshClient
-    ) : this(gattServer, meshDiscovery = null, wsMeshClient = wsMeshClient)
-
-    /**
-     * Legacy UDP-backed relay.
-     * Audio is sent directly peer-to-peer via UDP multicast/unicast.
-     */
-    constructor(
-        gattServer: GlassesGattServer,
-        meshDiscovery: MeshDiscovery
-    ) : this(gattServer, meshDiscovery = meshDiscovery, wsMeshClient = null)
-
-    // -- Glasses -> Mesh -------------------------------------------
+    // -- Glasses → Mesh -------------------------------------------
 
     /**
      * Called when glasses send an Opus audio frame via BLE write on ea01.
-     * Forward it to all mesh peers.
+     * Looks up the sender's dedicated WS connection and sends through it.
      *
      * @param opusFrame Raw Opus-encoded audio bytes.
-     * @param senderDeviceMac BLE MAC of the glasses that originated this frame.
-     *   Tracked for echo prevention: when mesh audio comes back, the GATT server
-     *   should skip notifying this device (so the user doesn't hear themselves).
-     *   Pass null if the sender device is unknown.
+     * @param senderMac BLE MAC of the glasses that originated this frame.
      */
-    fun onAudioFromGlasses(opusFrame: ByteArray, senderDeviceMac: String? = null) {
-        // Store the last sender so onAudioFromMesh can exclude it
-        senderDeviceMac?.let { lastSenderMac = it }
-
-        if (wsMeshClient != null) {
-            wsMeshClient.sendAudioToMesh(opusFrame)
+    fun onAudioFromGlasses(opusFrame: ByteArray, senderMac: String) {
+        val client = meshManager.getClientForGlass(senderMac)
+        if (client != null) {
+            client.sendAudioToMesh(opusFrame)
+            packetsRelayed.incrementAndGet()
+            Log.v(TAG, "glasses($senderMac)->mesh: ${opusFrame.size}B")
         } else {
-            meshDiscovery?.sendAudioToMesh(opusFrame)
+            Log.w(TAG, "No WS client for glass $senderMac — audio dropped")
         }
-
-        packetsRelayed.incrementAndGet()
-        Log.v(TAG, "glasses->mesh: ${opusFrame.size}B" +
-                (senderDeviceMac?.let { " from $it" } ?: ""))
     }
 
-    // -- Mesh -> Glasses -------------------------------------------
+    // -- Mesh → Glasses -------------------------------------------
 
     /**
-     * Called when a mesh peer sends an Opus audio frame (via WebSocket).
-     * Forward it to the connected glasses via BLE notification on ea02.
+     * Called when a mesh peer sends audio that arrived on the WS connection
+     * belonging to [forGlassMac]. Deliver to that specific glass only.
      *
      * @param opusFrame Raw Opus-encoded audio bytes from the mesh.
-     * @param fromPeer Peer that originated the frame (WebSocket variant).
+     * @param forGlassMac The glass MAC whose WS connection received this audio.
      */
-    fun onAudioFromMesh(opusFrame: ByteArray, fromPeer: WebSocketMeshClient.PeerInfo) {
-        deliverToGlasses(opusFrame, fromPeer.userId)
-    }
-
-    /**
-     * Called when a mesh peer sends an Opus audio frame (legacy UDP variant).
-     *
-     * @param opusFrame Raw Opus-encoded audio bytes from the mesh.
-     * @param fromPeer Peer that originated the frame (UDP variant).
-     */
-    fun onAudioFromMesh(opusFrame: ByteArray, fromPeer: MeshDiscovery.PeerInfo) {
-        deliverToGlasses(opusFrame, fromPeer.userId)
-    }
-
-    /**
-     * Internal: deliver mesh audio to glasses, with echo-prevention logging.
-     *
-     * Currently broadcasts to ALL connected glasses via sendAudioToGlasses().
-     * The [lastSenderMac] field holds the MAC of the glasses that most recently
-     * sent audio. When GlassesGattServer is updated to support multi-device
-     * broadcast with exclusion, pass lastSenderMac to skip the originating
-     * device and prevent echo.
-     */
-    private fun deliverToGlasses(opusFrame: ByteArray, fromUserId: String) {
-        // TODO: pass lastSenderMac to gattServer.sendAudioToGlasses() once
-        // it supports an excludeDevice parameter for echo prevention.
-        val sent = gattServer.sendAudioToGlasses(opusFrame, lastSenderMac)
+    fun onAudioFromMesh(opusFrame: ByteArray, forGlassMac: String) {
+        val sent = gattServer.sendAudioToSingleGlass(forGlassMac, opusFrame)
         if (sent > 0) {
             packetsRelayed.incrementAndGet()
-            Log.v(TAG, "mesh($fromUserId)->glasses: ${opusFrame.size}B")
+            Log.v(TAG, "mesh->glasses($forGlassMac): ${opusFrame.size}B")
         }
     }
 
-    // -- Echo prevention state -------------------------------------
-
-    /**
-     * MAC address of the last glasses device that sent audio.
-     * Used for echo prevention: when relaying mesh audio back to glasses,
-     * the GATT server should skip this device to avoid echo.
-     *
-     * Thread-safe via volatile; acceptable to have brief race windows
-     * since echo prevention is best-effort.
-     */
-    @Volatile
-    var lastSenderMac: String? = null
-        private set
-
-    // -- Stats -----------------------------------------------------
+    // -- Stats ----------------------------------------------------
 
     fun resetStats() {
         packetsRelayed.set(0)
