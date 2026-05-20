@@ -7,11 +7,14 @@ import android.content.Context
 import android.os.ParcelUuid
 import android.util.Log
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * BLE GATT Server for MeshTalk glasses connection.
  *
  * The phone acts as a GATT server — glasses connect to us.
+ * Supports MULTIPLE simultaneous glasses connections.
+ *
  * Protocol:
  *   Service UUID: 6ba1b218-15a8-461f-9fa8-5dcae273ea00
  *   ea01 — Audio TX from glasses (Write): glasses push Opus frames here
@@ -40,20 +43,22 @@ class GlassesGattServer(
     interface Listener {
         fun onGlassesConnected(device: BluetoothDevice)
         fun onGlassesDisconnected(device: BluetoothDevice)
-        fun onAudioFromGlasses(data: ByteArray)
-        fun onControlMessage(json: String)
+        fun onAudioFromGlasses(device: BluetoothDevice, data: ByteArray)
+        fun onControlMessage(device: BluetoothDevice, json: String)
         fun onLog(msg: String)
     }
 
     private var bluetoothManager: BluetoothManager? = null
     private var gattServer: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
-    private var connectedDevice: BluetoothDevice? = null
     private var audioRxChar: BluetoothGattCharacteristic? = null
     private var statusChar: BluetoothGattCharacteristic? = null
 
-    // Track which characteristics have notifications enabled
-    private val notificationsEnabled = mutableSetOf<UUID>()
+    /** All currently connected glasses, keyed by MAC address */
+    private val connectedDevices = ConcurrentHashMap<String, BluetoothDevice>()
+
+    /** Per-device notification subscriptions: MAC → set of characteristic UUIDs with notifications enabled */
+    private val deviceNotifications = ConcurrentHashMap<String, MutableSet<UUID>>()
 
     fun start(): Boolean {
         bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -133,38 +138,84 @@ class GlassesGattServer(
 
     fun stop() {
         stopAdvertising()
-        connectedDevice?.let {
-            gattServer?.cancelConnection(it)
+        // Disconnect all connected devices
+        for ((_, device) in connectedDevices) {
+            gattServer?.cancelConnection(device)
         }
         gattServer?.close()
         gattServer = null
-        connectedDevice = null
-        notificationsEnabled.clear()
+        connectedDevices.clear()
+        deviceNotifications.clear()
         Log.i(TAG, "GATT server stopped")
         listener.onLog("BLE GATT server stopped")
     }
 
-    /** Send an Opus audio frame to the connected glasses via notification on ea02 */
-    fun sendAudioToGlasses(opusFrame: ByteArray): Boolean {
-        val device = connectedDevice ?: return false
-        val char = audioRxChar ?: return false
-        if (CHAR_AUDIO_RX !in notificationsEnabled) return false
-
-        char.value = opusFrame
-        return gattServer?.notifyCharacteristicChanged(device, char, false) ?: false
+    /**
+     * Send an Opus audio frame to ALL connected glasses via notification on ea02.
+     * Returns the number of devices the frame was sent to.
+     */
+    fun sendAudioToGlasses(opusFrame: ByteArray): Int {
+        return sendAudioToGlasses(opusFrame, excludeDevice = null)
     }
 
-    /** Send a status JSON to the connected glasses via notification on ea04 */
-    fun sendStatus(json: String): Boolean {
-        val device = connectedDevice ?: return false
-        val char = statusChar ?: return false
-        if (CHAR_STATUS !in notificationsEnabled) return false
+    /**
+     * Send an Opus audio frame to all connected glasses EXCEPT [excludeDevice].
+     * This prevents echo: audio from Glass A is forwarded to Glass B (and vice versa)
+     * but not back to Glass A.
+     *
+     * @param opusFrame  The Opus-encoded audio frame to send
+     * @param excludeDevice  MAC address of the device to exclude (typically the sender), or null to send to all
+     * @return the number of devices the frame was actually sent to
+     */
+    fun sendAudioToGlasses(opusFrame: ByteArray, excludeDevice: String?): Int {
+        val char = audioRxChar ?: return 0
+        val server = gattServer ?: return 0
+        var sentCount = 0
 
-        char.value = json.toByteArray(Charsets.UTF_8)
-        return gattServer?.notifyCharacteristicChanged(device, char, false) ?: false
+        for ((mac, device) in connectedDevices) {
+            // Skip the excluded device (anti-echo)
+            if (mac == excludeDevice) continue
+
+            // Only send if this device has notifications enabled for audio RX
+            val notifications = deviceNotifications[mac] ?: continue
+            if (CHAR_AUDIO_RX !in notifications) continue
+
+            char.value = opusFrame
+            val sent = server.notifyCharacteristicChanged(device, char, false)
+            if (sent) sentCount++
+        }
+        return sentCount
     }
 
-    val isGlassesConnected: Boolean get() = connectedDevice != null
+    /**
+     * Send a status JSON to ALL connected glasses via notification on ea04.
+     * Returns the number of devices the status was sent to.
+     */
+    fun sendStatus(json: String): Int {
+        val char = statusChar ?: return 0
+        val server = gattServer ?: return 0
+        val data = json.toByteArray(Charsets.UTF_8)
+        var sentCount = 0
+
+        for ((mac, device) in connectedDevices) {
+            val notifications = deviceNotifications[mac] ?: continue
+            if (CHAR_STATUS !in notifications) continue
+
+            char.value = data
+            val sent = server.notifyCharacteristicChanged(device, char, false)
+            if (sent) sentCount++
+        }
+        return sentCount
+    }
+
+    /** True if at least one pair of glasses is connected */
+    val isGlassesConnected: Boolean get() = connectedDevices.isNotEmpty()
+
+    /** Number of currently connected glasses */
+    val connectedDeviceCount: Int get() = connectedDevices.size
+
+    /** Snapshot of currently connected device MAC addresses */
+    val connectedDeviceAddresses: Set<String> get() = connectedDevices.keys.toSet()
 
     // ── Advertising ──────────────────────────────────────────────
 
@@ -217,21 +268,21 @@ class GlassesGattServer(
     private val gattCallback = object : BluetoothGattServerCallback() {
 
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            val mac = device.address
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    Log.i(TAG, "Glasses connected: ${device.address}")
-                    connectedDevice = device
+                    Log.i(TAG, "Glasses connected: $mac (total: ${connectedDevices.size + 1})")
+                    connectedDevices[mac] = device
+                    deviceNotifications[mac] = ConcurrentHashMap.newKeySet()
                     listener.onGlassesConnected(device)
-                    listener.onLog("Glasses connected: ${device.address}")
+                    listener.onLog("Glasses connected: $mac (${connectedDevices.size} total)")
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    Log.i(TAG, "Glasses disconnected: ${device.address}")
-                    if (connectedDevice?.address == device.address) {
-                        connectedDevice = null
-                        notificationsEnabled.clear()
-                    }
+                    Log.i(TAG, "Glasses disconnected: $mac (remaining: ${connectedDevices.size - 1})")
+                    connectedDevices.remove(mac)
+                    deviceNotifications.remove(mac)
                     listener.onGlassesDisconnected(device)
-                    listener.onLog("Glasses disconnected")
+                    listener.onLog("Glasses disconnected: $mac (${connectedDevices.size} remaining)")
                 }
             }
         }
@@ -247,16 +298,16 @@ class GlassesGattServer(
         ) {
             when (characteristic.uuid) {
                 CHAR_AUDIO_TX -> {
-                    // Opus audio frame from glasses
-                    listener.onAudioFromGlasses(value)
+                    // Opus audio frame from glasses — pass device so caller knows the source
+                    listener.onAudioFromGlasses(device, value)
                     if (responseNeeded) {
                         gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
                     }
                 }
                 CHAR_CONTROL -> {
-                    // Control message (JSON)
+                    // Control message (JSON) — pass device so caller knows the source
                     val json = String(value, Charsets.UTF_8)
-                    listener.onControlMessage(json)
+                    listener.onControlMessage(device, json)
                     if (responseNeeded) {
                         gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
                     }
@@ -291,13 +342,18 @@ class GlassesGattServer(
             value: ByteArray
         ) {
             if (descriptor.uuid == CCCD_UUID) {
+                val mac = device.address
                 val charUuid = descriptor.characteristic.uuid
+                // Ensure we have a notification set for this device
+                val notifications = deviceNotifications.getOrPut(mac) {
+                    ConcurrentHashMap.newKeySet()
+                }
                 if (value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
-                    notificationsEnabled.add(charUuid)
-                    Log.d(TAG, "Notifications enabled for $charUuid")
+                    notifications.add(charUuid)
+                    Log.d(TAG, "Notifications enabled for $charUuid on device $mac")
                 } else if (value.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE)) {
-                    notificationsEnabled.remove(charUuid)
-                    Log.d(TAG, "Notifications disabled for $charUuid")
+                    notifications.remove(charUuid)
+                    Log.d(TAG, "Notifications disabled for $charUuid on device $mac")
                 }
             }
             if (responseNeeded) {
@@ -312,8 +368,10 @@ class GlassesGattServer(
             descriptor: BluetoothGattDescriptor
         ) {
             if (descriptor.uuid == CCCD_UUID) {
+                val mac = device.address
                 val charUuid = descriptor.characteristic.uuid
-                val value = if (charUuid in notificationsEnabled) {
+                val notifications = deviceNotifications[mac]
+                val value = if (notifications != null && charUuid in notifications) {
                     BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 } else {
                     BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
@@ -325,8 +383,8 @@ class GlassesGattServer(
         }
 
         override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
-            Log.i(TAG, "MTU changed to $mtu")
-            listener.onLog("MTU: $mtu")
+            Log.i(TAG, "MTU changed to $mtu for device ${device?.address}")
+            listener.onLog("MTU: $mtu (${device?.address})")
         }
     }
 }

@@ -6,6 +6,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothDevice
 import android.content.Intent
+import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
@@ -15,49 +16,83 @@ import com.meshtalk.companion.MainActivity
 import com.meshtalk.companion.R
 import com.meshtalk.companion.ble.GlassesGattServer
 import com.meshtalk.companion.mesh.AudioRelay
-import com.meshtalk.companion.mesh.MeshDiscovery
+import com.meshtalk.companion.mesh.WebSocketMeshClient
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
 /**
- * Foreground service that runs the BLE GATT server and mesh discovery.
+ * Foreground service that runs the BLE GATT server and WebSocket mesh client.
  *
  * Lifecycle:
  *   startService → onCreate → onStartCommand → startForeground → start BLE + mesh
  *   stopService → onDestroy → stop BLE + mesh
+ *
+ * The mesh bridge connection uses an ADB reverse tunnel:
+ *   adb reverse tcp:8440 tcp:8440
+ * so 127.0.0.1:8440 on the phone reaches the dev machine's bridge server.
+ *
+ * Hardened for 24/7 background operation on Samsung Galaxy A13:
+ * - START_STICKY + restart alarm on task removal
+ * - PARTIAL_WAKE_LOCK held for entire service lifetime
+ * - ServiceWatchdog (AlarmManager + WorkManager) keeps service alive
+ * - Rich foreground notification (non-dismissible) with live stats
  */
 @SuppressLint("MissingPermission")
 class CompanionService : Service() {
 
     companion object {
         private const val TAG = "CompanionService"
+        private const val MESH_BRIDGE_HOST = "127.0.0.1"
+        private const val MESH_BRIDGE_PORT = 8440
+        private const val MESH_CHANNEL = "alpha"
     }
 
     private var gattServer: GlassesGattServer? = null
-    private var meshDiscovery: MeshDiscovery? = null
+    private var meshClient: WebSocketMeshClient? = null
     private var audioRelay: AudioRelay? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var statusTask: ScheduledFuture<*>? = null
+    private var notificationUpdateTask: ScheduledFuture<*>? = null
 
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
 
     private var glassesConnected = false
-    private var currentChannel = 0
+    private var meshBridgeConnected = false
+    private var currentChannel = MESH_CHANNEL
+    private var bleConnectionCount = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "Service created")
-        startForeground(CompanionApp.NOTIFICATION_ID, buildNotification("Starting..."))
+        startForeground(CompanionApp.NOTIFICATION_ID, buildNotification())
         acquireWakeLock()
         startComponents()
+
+        // Arm watchdog from service side too (belt and suspenders)
+        ServiceWatchdog.arm(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val startedBy = intent?.getStringExtra("started_by") ?: "direct"
+        Log.i(TAG, "onStartCommand (startedBy=$startedBy, flags=$flags, startId=$startId)")
+
+        // Re-verify wake lock is held on every start command
+        ensureWakeLockHeld()
+
         return START_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.w(TAG, "Task removed (app swiped from recents) — scheduling restart")
+
+        // Schedule a restart alarm as fallback beyond START_STICKY
+        ServiceWatchdog.scheduleRestartAlarm(this, delayMs = 3000L)
+
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
@@ -72,31 +107,44 @@ class CompanionService : Service() {
         val gatt = GlassesGattServer(this, gattListener)
         gattServer = gatt
 
-        // Create mesh discovery
-        val mesh = MeshDiscovery(this, meshListener)
-        meshDiscovery = mesh
+        // Create WebSocket mesh client
+        val userId = "phone_${Build.MODEL.replace(" ", "_")}_${System.currentTimeMillis() % 10000}"
+        val mesh = WebSocketMeshClient(
+            host = MESH_BRIDGE_HOST,
+            port = MESH_BRIDGE_PORT,
+            userId = userId,
+            initialChannel = currentChannel,
+            listener = meshListener
+        )
+        meshClient = mesh
 
-        // Create audio relay
+        // Create audio relay (WebSocket-backed)
         audioRelay = AudioRelay(gatt, mesh)
 
         // Start components
         val bleOk = gatt.start()
-        val meshOk = mesh.start()
+        mesh.start()
 
-        sendLog("BLE: ${if (bleOk) "OK" else "FAILED"} | Mesh: ${if (meshOk) "OK" else "FAILED"}")
+        sendLog("BLE: ${if (bleOk) "OK" else "FAILED"} | Mesh: connecting to $MESH_BRIDGE_HOST:$MESH_BRIDGE_PORT")
 
         // Periodic status broadcast
         statusTask = scheduler.scheduleAtFixedRate({
             broadcastStatus()
         }, 1, 2, TimeUnit.SECONDS)
+
+        // Periodic notification update with live stats
+        notificationUpdateTask = scheduler.scheduleAtFixedRate({
+            updateNotificationWithStats()
+        }, 5, 10, TimeUnit.SECONDS)
     }
 
     private fun stopComponents() {
         statusTask?.cancel(false)
+        notificationUpdateTask?.cancel(false)
         gattServer?.stop()
-        meshDiscovery?.stop()
+        meshClient?.stop()
         gattServer = null
-        meshDiscovery = null
+        meshClient = null
         audioRelay = null
     }
 
@@ -105,21 +153,25 @@ class CompanionService : Service() {
     private val gattListener = object : GlassesGattServer.Listener {
         override fun onGlassesConnected(device: BluetoothDevice) {
             glassesConnected = true
-            updateNotification("Glasses connected: ${device.address}")
+            bleConnectionCount++
+            updateNotificationWithStats()
             broadcastStatus()
         }
 
         override fun onGlassesDisconnected(device: BluetoothDevice) {
-            glassesConnected = false
-            updateNotification("Waiting for glasses...")
+            // Only set glassesConnected=false if no other glasses remain connected
+            val stillConnected = gattServer?.isGlassesConnected == true
+            glassesConnected = stillConnected
+            updateNotificationWithStats()
             broadcastStatus()
         }
 
-        override fun onAudioFromGlasses(data: ByteArray) {
-            audioRelay?.onAudioFromGlasses(data)
+        override fun onAudioFromGlasses(device: BluetoothDevice, data: ByteArray) {
+            // Pass sender device MAC for echo prevention
+            audioRelay?.onAudioFromGlasses(data, senderDeviceMac = device.address)
         }
 
-        override fun onControlMessage(json: String) {
+        override fun onControlMessage(device: BluetoothDevice, json: String) {
             handleControlMessage(json)
         }
 
@@ -130,12 +182,24 @@ class CompanionService : Service() {
 
     // ── Mesh Listener ────────────────────────────────────────────
 
-    private val meshListener = object : MeshDiscovery.Listener {
-        override fun onPeersChanged(peers: List<MeshDiscovery.PeerInfo>) {
+    private val meshListener = object : WebSocketMeshClient.Listener {
+        override fun onConnected() {
+            meshBridgeConnected = true
+            updateNotificationWithStats()
             broadcastStatus()
         }
 
-        override fun onAudioFromMesh(data: ByteArray, fromPeer: MeshDiscovery.PeerInfo) {
+        override fun onDisconnected() {
+            meshBridgeConnected = false
+            updateNotificationWithStats()
+            broadcastStatus()
+        }
+
+        override fun onPeersChanged(peers: List<WebSocketMeshClient.PeerInfo>) {
+            broadcastStatus()
+        }
+
+        override fun onAudioFromMesh(data: ByteArray, fromPeer: WebSocketMeshClient.PeerInfo) {
             audioRelay?.onAudioFromMesh(data, fromPeer)
         }
 
@@ -150,12 +214,6 @@ class CompanionService : Service() {
         try {
             val obj = JSONObject(json)
             when (obj.optString("type")) {
-                "channel_change" -> {
-                    currentChannel = obj.optInt("channel", 0)
-                    meshDiscovery?.currentChannel = currentChannel
-                    sendLog("Channel changed to $currentChannel")
-                    broadcastStatus()
-                }
                 "ping" -> {
                     sendLog("Ping from glasses")
                 }
@@ -168,20 +226,23 @@ class CompanionService : Service() {
     // ── Status Broadcasting ──────────────────────────────────────
 
     private fun broadcastStatus() {
+        val peerCount = meshClient?.getPeersOnChannel()?.size ?: 0
         val intent = Intent(MainActivity.ACTION_STATUS_UPDATE).apply {
             setPackage(packageName)
             putExtra(MainActivity.EXTRA_BLE_CONNECTED, glassesConnected)
             putExtra(MainActivity.EXTRA_CHANNEL, currentChannel)
-            putExtra(MainActivity.EXTRA_PEER_COUNT, meshDiscovery?.getPeersOnChannel()?.size ?: 0)
+            putExtra(MainActivity.EXTRA_PEER_COUNT, peerCount)
             putExtra(MainActivity.EXTRA_PACKET_COUNT, audioRelay?.totalPacketsRelayed ?: 0L)
+            putExtra(EXTRA_MESH_CONNECTED, meshBridgeConnected)
         }
         sendBroadcast(intent)
 
         // Also send status to glasses via BLE
         val statusJson = JSONObject().apply {
-            put("peers", meshDiscovery?.getPeersOnChannel()?.size ?: 0)
+            put("peers", peerCount)
             put("channel", currentChannel)
-            put("mesh_active", meshDiscovery != null)
+            put("mesh_connected", meshBridgeConnected)
+            put("mesh_active", meshClient != null)
         }
         gattServer?.sendStatus(statusJson.toString())
     }
@@ -192,8 +253,9 @@ class CompanionService : Service() {
             setPackage(packageName)
             putExtra(MainActivity.EXTRA_BLE_CONNECTED, glassesConnected)
             putExtra(MainActivity.EXTRA_CHANNEL, currentChannel)
-            putExtra(MainActivity.EXTRA_PEER_COUNT, meshDiscovery?.getPeersOnChannel()?.size ?: 0)
+            putExtra(MainActivity.EXTRA_PEER_COUNT, meshClient?.getPeersOnChannel()?.size ?: 0)
             putExtra(MainActivity.EXTRA_PACKET_COUNT, audioRelay?.totalPacketsRelayed ?: 0L)
+            putExtra(EXTRA_MESH_CONNECTED, meshBridgeConnected)
             putExtra(MainActivity.EXTRA_LOG_LINE, msg)
         }
         sendBroadcast(intent)
@@ -201,7 +263,21 @@ class CompanionService : Service() {
 
     // ── Notification ─────────────────────────────────────────────
 
-    private fun buildNotification(text: String): Notification {
+    private fun buildNotification(): Notification {
+        val peerCount = meshClient?.getPeersOnChannel()?.size ?: 0
+        val packetsRelayed = audioRelay?.totalPacketsRelayed ?: 0L
+        val bleStatus = if (glassesConnected) "BLE: ✓ Connected" else "BLE: ✗ Waiting"
+        val meshStatus = if (meshBridgeConnected) "Mesh: ✓ Online" else "Mesh: ✗ Offline"
+
+        val contentText = "$bleStatus | $meshStatus"
+        val expandedText = buildString {
+            appendLine("BLE Connections: $bleConnectionCount (current: ${if (glassesConnected) "active" else "none"})")
+            appendLine("Mesh Bridge: ${if (meshBridgeConnected) "connected" else "disconnected"}")
+            appendLine("Channel: ${currentChannel.replaceFirstChar { it.uppercase() }}")
+            appendLine("Peers on channel: $peerCount")
+            appendLine("Audio packets relayed: $packetsRelayed")
+        }
+
         val pendingIntent = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
@@ -209,18 +285,27 @@ class CompanionService : Service() {
         )
 
         return NotificationCompat.Builder(this, CompanionApp.NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("MeshTalk")
-            .setContentText(text)
+            .setContentTitle("MeshTalk — ${currentChannel.replaceFirstChar { it.uppercase() }}")
+            .setContentText(contentText)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(expandedText))
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentIntent(pendingIntent)
-            .setOngoing(true)
+            .setOngoing(true)          // Can't be swiped away
             .setSilent(true)
+            .setOnlyAlertOnce(true)    // Don't buzz on updates
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }
 
-    private fun updateNotification(text: String) {
-        val nm = getSystemService(android.app.NotificationManager::class.java)
-        nm.notify(CompanionApp.NOTIFICATION_ID, buildNotification(text))
+    private fun updateNotificationWithStats() {
+        try {
+            val nm = getSystemService(android.app.NotificationManager::class.java)
+            nm.notify(CompanionApp.NOTIFICATION_ID, buildNotification())
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to update notification: ${e.message}")
+        }
     }
 
     // ── Wake Lock ────────────────────────────────────────────────
@@ -231,13 +316,38 @@ class CompanionService : Service() {
         wakeLock = pm.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
             "meshtalk:companion_service"
-        ).apply { acquire() }
+        ).apply {
+            setReferenceCounted(false)  // Prevent double-release issues
+            acquire()
+        }
+        Log.i(TAG, "PARTIAL_WAKE_LOCK acquired (referenceCounted=false, indefinite hold)")
+    }
+
+    /**
+     * Verify wake lock is still held — can be lost after certain system events.
+     * Called on every onStartCommand to ensure robustness.
+     */
+    @SuppressLint("WakelockTimeout")
+    private fun ensureWakeLockHeld() {
+        val wl = wakeLock
+        if (wl == null || !wl.isHeld) {
+            Log.w(TAG, "Wake lock was NOT held — re-acquiring!")
+            acquireWakeLock()
+        } else {
+            Log.d(TAG, "Wake lock verified: held=true")
+        }
     }
 
     private fun releaseWakeLock() {
         wakeLock?.let {
-            if (it.isHeld) it.release()
+            if (it.isHeld) {
+                it.release()
+                Log.i(TAG, "Wake lock released")
+            }
         }
         wakeLock = null
     }
 }
+
+/** Extra key for mesh bridge connection status in status broadcasts. */
+const val EXTRA_MESH_CONNECTED = "mesh_connected"
