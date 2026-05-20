@@ -33,6 +33,13 @@ class MainActivity : AppCompatActivity() {
         const val EXTRA_PEER_COUNT = "peer_count"
         const val EXTRA_PACKET_COUNT = "packet_count"
         const val EXTRA_LOG_LINE = "log_line"
+
+        // Pi Design Language colors
+        private const val COLOR_SAGE_GREEN = 0xFF4A7C59.toInt()
+        private const val COLOR_ACTIVE_GREEN = 0xFF3D8B37.toInt()
+        private const val COLOR_SOFT_RED = 0xFFC75050.toInt()
+        private const val COLOR_PRIMARY_TEXT = 0xFF2C3E2D.toInt()
+        private const val COLOR_SECONDARY_TEXT = 0xFF5A6B5A.toInt()
     }
 
     private lateinit var bleStatusDot: android.view.View
@@ -43,6 +50,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var serviceStatusText: TextView
     private lateinit var logText: TextView
     private lateinit var startStopButton: MaterialButton
+
+    // Mesh WebSocket status dot (separate from BLE)
+    private var meshStatusDot: android.view.View? = null
 
     private var serviceRunning = false
     private val logLines = mutableListOf<String>()
@@ -68,6 +78,9 @@ class MainActivity : AppCompatActivity() {
         serviceStatusText = findViewById(R.id.serviceStatusText)
         logText = findViewById(R.id.logText)
         startStopButton = findViewById(R.id.startStopButton)
+
+        // Mesh WebSocket status indicator (may not exist in older layouts)
+        meshStatusDot = findViewById(R.id.meshStatusDot)
 
         startStopButton.setOnClickListener { toggleService() }
 
@@ -110,15 +123,24 @@ class MainActivity : AppCompatActivity() {
         val meshConnected = intent.getBooleanExtra(
             com.meshtalk.companion.service.EXTRA_MESH_CONNECTED, false)
 
-        // Update BLE status
+        // Update BLE status with Pi palette colors
         if (bleConnected) {
             bleStatusDot.setBackgroundResource(R.drawable.status_dot_green)
             bleStatusText.text = "Connected"
-            bleStatusText.setTextColor(0xFF00E676.toInt())
+            bleStatusText.setTextColor(COLOR_SAGE_GREEN)
         } else {
             bleStatusDot.setBackgroundResource(R.drawable.status_dot_red)
             bleStatusText.text = "Waiting for glasses..."
-            bleStatusText.setTextColor(0xFFFF5252.toInt())
+            bleStatusText.setTextColor(COLOR_SOFT_RED)
+        }
+
+        // Update mesh WebSocket status dot
+        meshStatusDot?.let { dot ->
+            if (meshConnected) {
+                dot.setBackgroundResource(R.drawable.status_dot_green)
+            } else {
+                dot.setBackgroundResource(R.drawable.status_dot_red)
+            }
         }
 
         // Update channel
@@ -149,9 +171,10 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.startForegroundService(this, intent)
         serviceRunning = true
         serviceStatusText.text = "Running"
-        serviceStatusText.setTextColor(0xFF00E676.toInt())
+        serviceStatusText.setTextColor(COLOR_SAGE_GREEN)
+        meshStatusDot?.setBackgroundResource(R.drawable.status_dot_green)
         startStopButton.text = "STOP SERVICE"
-        startStopButton.setBackgroundColor(0xFFFF5252.toInt())
+        startStopButton.setBackgroundResource(R.drawable.button_stop)
         addLog("Service started")
     }
 
@@ -162,9 +185,10 @@ class MainActivity : AppCompatActivity() {
         stopService(intent)
         serviceRunning = false
         serviceStatusText.text = "Stopped"
-        serviceStatusText.setTextColor(0xFFFF5252.toInt())
+        serviceStatusText.setTextColor(COLOR_SOFT_RED)
+        meshStatusDot?.setBackgroundResource(R.drawable.status_dot_red)
         startStopButton.text = "START SERVICE"
-        startStopButton.setBackgroundColor(0xFF00E676.toInt())
+        startStopButton.setBackgroundResource(R.drawable.button_start)
         addLog("Service stopped")
     }
 

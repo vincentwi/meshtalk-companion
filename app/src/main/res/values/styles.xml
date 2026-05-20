@@ -1,14 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.MeshTalk" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <item name="colorPrimary">#00E676</item>
-        <item name="colorPrimaryVariant">#00C853</item>
-        <item name="colorOnPrimary">#000000</item>
-        <item name="colorSecondary">#80CBC4</item>
-        <item name="colorSecondaryVariant">#4DB6AC</item>
-        <item name="colorOnSecondary">#000000</item>
-        <item name="android:statusBarColor">#121212</item>
-        <item name="android:navigationBarColor">#121212</item>
-        <item name="android:windowBackground">#121212</item>
+    <style name="Theme.MeshTalk" parent="Theme.MaterialComponents.Light.NoActionBar">
+        <!-- Pi Design Language: warm cream + sage green -->
+        <item name="colorPrimary">@color/mesh_accent</item>
+        <item name="colorPrimaryVariant">@color/mesh_active</item>
+        <item name="colorOnPrimary">@color/mesh_button_text</item>
+        <item name="colorSecondary">@color/mesh_accent_light</item>
+        <item name="colorSecondaryVariant">@color/mesh_accent</item>
+        <item name="colorOnSecondary">@color/mesh_primary_text</item>
+
+        <!-- Warm cream status/nav bars with dark icons -->
+        <item name="android:statusBarColor">@color/mesh_status_bar</item>
+        <item name="android:navigationBarColor">@color/mesh_nav_bar</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowBackground">@color/mesh_background</item>
+
+        <!-- Surface colors -->
+        <item name="colorSurface">@color/mesh_surface</item>
+        <item name="colorOnSurface">@color/mesh_primary_text</item>
     </style>
 </resources>
